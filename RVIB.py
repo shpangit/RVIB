@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
+import math
 
 # A method to build a PyTorch dataset for training. Inputs X and the target Y is given.
 # For this model, the recurrent neural network takes an input in 3dimension (n_samples, n_times, n_features)
@@ -33,8 +34,8 @@ def get_dataloader(X,y,batch_size = 1,shuffle=False,device='cpu',regression=True
 
 # The classo of RVIB model which is based on a single layer of GRU and a final Dense layer for prediction.
 class RVIB_GRU(nn.Module):
-    def __init__(self, input_dim, z_dim, time_dim, #Input dimension
-                 beta=1, #IB principle hyper-parmeters
+    def __init__(self, input_dim, time_dim, #Input dimension
+                 z_dim, beta=1, #IB principle hyper-parmeters
                  fixed_r = False,mu_r=0.,logvar_r=0.):# Prior distribution assumptions p(Z) ~ N(mu_r,var_r)
         """
 
@@ -93,7 +94,7 @@ class RVIB_GRU(nn.Module):
         Process the forward operation for the GRU parts
 
         Args:
-            x (torch.Tensor)
+            x (torch.Tensor) of dimesion (batch_size, time_dim, input_dim): The input sequence.
             return_full (bool): If True, the method returns the whole sequence of hidden states h.
 
         Returns:
@@ -124,6 +125,23 @@ class RVIB_GRU(nn.Module):
         return y_hat,mu,std
     
     def compute_kl(self,mu1,logvar1,mu2,logvar2):
+        """
+        Compute KL divergence KL(p_1 || p_2) between two gaussian multivariate distribution
+        KL = 0.5*( \sum_{j=1}^{d}\log\frac{sigma_2^2 (j)}{sigma_1^2 (j)} - d 
+                    + \sum_{j=1}^{d} \frac{(mu_1 (j)- mu_2 (j))^2 }{sigma_2^2 (j)}
+                    + \sum_{j=1}^{d} \frac{sigma_1^2 (j)}{sigma_2^2 (j)}
+                    )
+
+        Args:
+            mu1 (float): expectation of distribution p_1
+            logvar1 (float): log of variance of distribution p_1
+            mu2 (float): expectation of distribution p_2
+            logvar2 (float): log of variance of distribution p_2
+
+        Returns:
+            float: KL value
+        """
+        
         dim = mu1.shape[-1]  
         
         L = logvar2 - logvar1
@@ -134,24 +152,11 @@ class RVIB_GRU(nn.Module):
         
         return kl
     
-    def encoding_loss(self,mu,std):
-        """
-        Compute KL(p(Z|X) || N(0,1))
-        mu,std : encoded parameters. Dependeing on the dimension, it could be a sequence loss, parallel loss etc
-        mu_r,logvar_r : comparison gaussian distribution
-        """
-        
-        mu_r = self.mu_r
-        logvar_r = self.logvar_r
-        logvar = 2*torch.log(std)
-        
-        kl = self.compute_kl(mu,logvar,mu_r,logvar_r)
-        
-        return kl.mean(dim=0)
-    
     def compute_entropy_gaus(self,logvar):
         """
-        Suppose the a multivariate gaussian distribution with diagonal cov matrix (given as a vector)
+        Suppose the a multivariate gaussian distribution with diagonal cov matrix (given as a vector).
+        Entropy is computed by: 
+        \frac{d}{2} (1 + \log(2.pi.\sigma)) + \frac{1}{2} \log \sum_{i=1}^{d}\sigma_{i}^2 
         """
         
         dim = logvar.shape[-1]
@@ -161,25 +166,23 @@ class RVIB_GRU(nn.Module):
         
         return 0.5*det_sigma + c 
     
-    ####################### 29/05/2023 CHECK THE CODE UNTIL HERE
     def encoding_loss(self,Mu,Std,reduction='mean'):
         
         # Preprocessing
-        mu = Mu
         logvar = 2*torch.log(Std)
         
         # Dimension warning
-        if mu.ndim<3:
+        if Mu.ndim<3:
             print("Sequence Encoding warning : parameters seems not having time dimension")
         
-        mu_shift = mu.roll(-1,dims=1) # Take the expectation of the next time sequence
+        mu_shift = Mu.roll(-1,dims=1) # Take the expectation of the next time sequence
         logvar_shift = logvar.roll(-1,dims=1)
 
         # Compute the KL(p(Z|X_{1:w}) || p(Z|X_{1:w-1}))
-        kl_t1 = self.compute_kl(mu_shift[:,:-1,:],logvar_shift[:,:-1,:],mu[:,:-1,:],logvar[:,:-1,:])
+        kl_t1 = self.compute_kl(mu_shift[:,:-1,:],logvar_shift[:,:-1,:],Mu[:,:-1,:],logvar[:,:-1,:])
         
         # Compute the KL(p(Z|X_{1}) || r(Z))
-        kl_t0 = self.compute_kl(mu[:,0,:],logvar[:,0,:],self.mu_r,self.logvar_r)
+        kl_t0 = self.compute_kl(Mu[:,0,:],logvar[:,0,:],self.mu_r,self.logvar_r)
         
         kl_time = torch.cat([kl_t0.unsqueeze(dim=1),kl_t1],dim=1)
 
@@ -191,13 +194,19 @@ class RVIB_GRU(nn.Module):
         else:
             raise ValueError ("Reudction for KL loss is possible only for \'mean\' or \'none\' ")
         
-        return kl_time # Summing the KL in time and mean on batch
+        return kl_time
             
     def decoding_loss(self,y_hat,y,mu,std):
         """
-        Closed form formula for the decoding loss. E[log(q(Y|Z))]
-        Sampling with reparametrization trick is not necessry since we suppose a linear layer.
-        y_hat = w.E[Z] + b = w.mu + b
+        Closed form formula for the decoding loss
+        A linear layer is assumed with the output distribution Y|Z ~ N(A.Z + \bias, cst).
+        The expectation is used as the approximation
+        E[Y] = E[E[Y|Z]] = E[A.Z+b] = A.mu + b = y_hat.
+        
+        decoding loss is then
+        dec_loss = E[log(q(Y|Z))] 
+            \propto -E[(A.Z+b)^2]
+            \propto - [(y - A.mu)^2 + A^2. \sigma^2]
         """
         
         w = self.decoder.weight
@@ -217,8 +226,7 @@ class RVIB_GRU(nn.Module):
         Computing all the losses.
         """
         
-        return_full = False
-        y_hat,mu,std = self(x,return_full)
+        y_hat,mu,std = self(x,return_full=True)
         m = self.decoding_loss(y_hat,y,mu,std)
         k = self.encoding_loss(mu,std)
         l = m+self.beta * k
