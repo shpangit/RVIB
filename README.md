@@ -13,4 +13,4 @@ Inputs are:
 - Trade-off parameter in IB (*beta*): $\beta$ parameter in IB-loss.
 - Parameters for prior distribution (*fixed_r,mu_r,logvar_r*): distribution characteristics for priori distribution $p(Z)$. If *fixed_r = False*, thes distribution paramters are also trained.
 
-An example on a time series is in ... 
+An example on a time series is in RVIB_example1.ipynb
