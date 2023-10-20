@@ -2,7 +2,7 @@
 
 Recurrent Variational Information Bottleneck.
 This model is a recurrent neural network trained with a loss function derived from the Information Bottleneck principle(IB).
-\[\max I(Z,Y) - \beta I(Z,X_{1:W}) \]
+$$ \max I(Z,Y) - \beta I(Z,X_{1:W}) $$
 For now, it is only one layer (one directional) GRU combined with a linear layer to obtain the target variable to adresse a regression problem.
 
 PyTorch (tested on 1.8.0) is used for the Gated Recurrent Unit(GRU) architecture.
